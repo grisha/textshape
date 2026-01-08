@@ -167,16 +167,6 @@ AV        [37+1249 58+1303]          [37+1249 58+1303]   ✓
 
 For complex scripts, consider using the full HarfBuzz via cgo or the [textlayout](https://github.com/boxesandglue/textlayout) package.
 
-## Demo Program
-
-```bash
-cd cmd/demo
-go build -o demo
-
-./demo -font /path/to/font.ttf -text "Hello"
-./demo -font /path/to/font.ttf -text "office"
-./demo -font /path/to/font.ttf -text "fi" -features "-liga"
-```
 
 ## License
 

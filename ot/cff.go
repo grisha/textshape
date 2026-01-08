@@ -16,12 +16,12 @@ type CFF struct {
 
 	Name        string
 	TopDict     TopDict
-	Strings     []string   // Custom strings (SID 391+)
-	GlobalSubrs [][]byte   // Global subroutines
-	CharStrings [][]byte   // Per-glyph CharStrings
+	Strings     []string // Custom strings (SID 391+)
+	GlobalSubrs [][]byte // Global subroutines
+	CharStrings [][]byte // Per-glyph CharStrings
 	PrivateDict PrivateDict
-	LocalSubrs  [][]byte   // Local subroutines
-	Charset     []GlyphID  // Glyph ID to SID mapping
+	LocalSubrs  [][]byte  // Local subroutines
+	Charset     []GlyphID // Glyph ID to SID mapping
 
 	// CID fonts
 	IsCID    bool
@@ -44,10 +44,10 @@ type TopDict struct {
 	FamilyName  int // SID
 	Weight      int // SID
 	FontBBox    [4]int
-	CharStrings int // Offset to CharStrings INDEX
+	CharStrings int    // Offset to CharStrings INDEX
 	Private     [2]int // [size, offset]
-	Charset     int // Offset to Charset
-	Encoding    int // Offset to Encoding
+	Charset     int    // Offset to Charset
+	Encoding    int    // Offset to Encoding
 
 	// CID fonts
 	ROS      [3]int // Registry, Ordering, Supplement (SIDs)
@@ -58,18 +58,18 @@ type TopDict struct {
 
 // PrivateDict contains private dictionary data.
 type PrivateDict struct {
-	BlueValues    []int
-	OtherBlues    []int
-	FamilyBlues   []int
+	BlueValues       []int
+	OtherBlues       []int
+	FamilyBlues      []int
 	FamilyOtherBlues []int
-	StdHW         int
-	StdVW         int
-	Subrs         int // Offset to Local Subrs (relative to Private DICT)
-	DefaultWidthX int
-	NominalWidthX int
-	BlueScale     float64
-	BlueShift     int
-	BlueFuzz      int
+	StdHW            int
+	StdVW            int
+	Subrs            int // Offset to Local Subrs (relative to Private DICT)
+	DefaultWidthX    int
+	NominalWidthX    int
+	BlueScale        float64
+	BlueShift        int
+	BlueFuzz         int
 }
 
 // FontDict contains per-font dictionary data (for CID fonts).
@@ -260,8 +260,8 @@ func readOffset(data []byte, size int) int {
 // parseTopDict parses a Top DICT.
 func parseTopDict(data []byte) (TopDict, error) {
 	dict := TopDict{
-		Charset:  0,  // Default charset
-		Encoding: 0,  // Default encoding
+		Charset:  0, // Default charset
+		Encoding: 0, // Default encoding
 	}
 
 	operands := make([]int, 0, 16)

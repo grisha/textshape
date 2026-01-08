@@ -8,11 +8,12 @@ import (
 
 // Common errors
 var (
-	ErrInvalidFont   = errors.New("invalid font data")
-	ErrTableNotFound = errors.New("table not found")
-	ErrInvalidTable  = errors.New("invalid table data")
-	ErrInvalidOffset = errors.New("offset out of bounds")
-	ErrInvalidFormat = errors.New("unsupported format")
+	ErrInvalidFont    = errors.New("invalid font data")
+	ErrTableNotFound  = errors.New("table not found")
+	ErrInvalidTable   = errors.New("invalid table data")
+	ErrInvalidOffset  = errors.New("offset out of bounds")
+	ErrInvalidFormat  = errors.New("unsupported format")
+	ErrInvalidFeature = errors.New("invalid feature string")
 )
 
 // Tag is a 4-byte OpenType tag.

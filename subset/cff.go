@@ -18,11 +18,11 @@ func (p *Plan) subsetCFF() ([]byte, error) {
 	// 1. Collect CharStrings for kept glyphs
 	usedCharStrings := make([][]byte, p.numOutputGlyphs)
 	for newGID := 0; newGID < p.numOutputGlyphs; newGID++ {
-		oldGID := p.reverseMap[ot.GlyphID(newGID)]
-		if int(oldGID) < len(cff.CharStrings) {
+		oldGID, exists := p.reverseMap[ot.GlyphID(newGID)]
+		if exists && int(oldGID) < len(cff.CharStrings) {
 			usedCharStrings[newGID] = cff.CharStrings[oldGID]
 		} else {
-			// Empty CharString for missing glyphs
+			// Empty CharString for missing glyphs (or padding slots with FlagRetainGIDs)
 			usedCharStrings[newGID] = []byte{14} // endchar
 		}
 	}
@@ -76,13 +76,16 @@ func (p *Plan) subsetCFF() ([]byte, error) {
 	}
 
 	// 6. Build subset subroutines
-	newGlobalSubrs := subsetSubrs(cff.GlobalSubrs, globalSubrMap, localSubrMap,
+	// Both types use (globalMap, localMap) order for RemapCharString
+	newGlobalSubrs := subsetSubrs(cff.GlobalSubrs, globalSubrMap,
+		globalSubrMap, localSubrMap,
 		oldGlobalBias, oldLocalBias, newGlobalBias, newLocalBias)
-	newLocalSubrs := subsetSubrs(cff.LocalSubrs, localSubrMap, globalSubrMap,
-		oldLocalBias, oldGlobalBias, newLocalBias, newGlobalBias)
+	newLocalSubrs := subsetSubrs(cff.LocalSubrs, localSubrMap,
+		globalSubrMap, localSubrMap,
+		oldGlobalBias, oldLocalBias, newGlobalBias, newLocalBias)
 
-	// 7. Build new Charset (Format 0 - simple array)
-	newCharset := buildCFFCharset(p.numOutputGlyphs)
+	// 7. Build new Charset (Format 0 - preserving original SIDs)
+	newCharset := buildCFFCharsetFromOriginal(cff.Charset, p.reverseMap, p.numOutputGlyphs)
 
 	// 8. Serialize
 	return serializeCFF(cff, usedCharStrings, newGlobalSubrs, newLocalSubrs, newCharset)
@@ -110,9 +113,12 @@ func buildSubrMap(used map[int]bool) map[int]int {
 }
 
 // subsetSubrs extracts and remaps used subroutines.
-func subsetSubrs(subrs [][]byte, primaryMap, secondaryMap map[int]int,
-	oldPrimaryBias, oldSecondaryBias, newPrimaryBias, newSecondaryBias int) [][]byte {
-	if len(primaryMap) == 0 {
+// subrMap is the mapping for THIS type of subroutine.
+// globalMap/localMap are for remapping calls WITHIN the subroutines.
+func subsetSubrs(subrs [][]byte, subrMap map[int]int,
+	globalMap, localMap map[int]int,
+	oldGlobalBias, oldLocalBias, newGlobalBias, newLocalBias int) [][]byte {
+	if len(subrMap) == 0 {
 		return nil
 	}
 
@@ -121,8 +127,8 @@ func subsetSubrs(subrs [][]byte, primaryMap, secondaryMap map[int]int,
 		oldNum int
 		newNum int
 	}
-	entries := make([]entry, 0, len(primaryMap))
-	for old, new := range primaryMap {
+	entries := make([]entry, 0, len(subrMap))
+	for old, new := range subrMap {
 		entries = append(entries, entry{old, new})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -133,8 +139,9 @@ func subsetSubrs(subrs [][]byte, primaryMap, secondaryMap map[int]int,
 	for _, e := range entries {
 		if e.oldNum >= 0 && e.oldNum < len(subrs) {
 			// Remap subroutine calls within the subroutine
-			remapped := ot.RemapCharString(subrs[e.oldNum], secondaryMap, primaryMap,
-				oldSecondaryBias, oldPrimaryBias, newSecondaryBias, newPrimaryBias)
+			// RemapCharString expects (globalMap, localMap) order
+			remapped := ot.RemapCharString(subrs[e.oldNum], globalMap, localMap,
+				oldGlobalBias, oldLocalBias, newGlobalBias, newLocalBias)
 			result[e.newNum] = remapped
 		} else {
 			result[e.newNum] = []byte{11} // return
@@ -143,8 +150,8 @@ func subsetSubrs(subrs [][]byte, primaryMap, secondaryMap map[int]int,
 	return result
 }
 
-// buildCFFCharset builds a Format 0 charset (simple SID array).
-func buildCFFCharset(numGlyphs int) []byte {
+// buildCFFCharsetFromOriginal builds a Format 0 charset preserving original SIDs.
+func buildCFFCharsetFromOriginal(origCharset []ot.GlyphID, reverseMap map[ot.GlyphID]ot.GlyphID, numGlyphs int) []byte {
 	if numGlyphs <= 1 {
 		return []byte{0} // Format 0, only .notdef
 	}
@@ -153,9 +160,20 @@ func buildCFFCharset(numGlyphs int) []byte {
 	buf := make([]byte, 1+(numGlyphs-1)*2)
 	buf[0] = 0 // Format 0
 
-	// Assign sequential SIDs starting from 1 (0 is .notdef)
-	for i := 1; i < numGlyphs; i++ {
-		binary.BigEndian.PutUint16(buf[1+(i-1)*2:], uint16(i))
+	// For each new glyph ID (except .notdef), look up the original SID
+	for newGID := 1; newGID < numGlyphs; newGID++ {
+		oldGID, exists := reverseMap[ot.GlyphID(newGID)]
+
+		// Get original SID from charset
+		var sid uint16
+		if exists && int(oldGID) < len(origCharset) {
+			sid = uint16(origCharset[oldGID])
+		} else {
+			// Fallback: use sequential SID for padding slots (FlagRetainGIDs)
+			sid = uint16(newGID)
+		}
+
+		binary.BigEndian.PutUint16(buf[1+(newGID-1)*2:], sid)
 	}
 	return buf
 }
@@ -187,7 +205,6 @@ func serializeCFF(original *ot.CFF, charStrings [][]byte,
 
 	// Private DICT (we need to build this to know its size)
 	var privateDict bytes.Buffer
-	localSubrsOffset := 0
 
 	// Copy relevant Private DICT values
 	if len(original.PrivateDict.BlueValues) > 0 {
@@ -211,15 +228,20 @@ func serializeCFF(original *ot.CFF, charStrings [][]byte,
 
 	// Local Subrs offset (relative to Private DICT start)
 	localSubrsINDEX := buildINDEX(localSubrs)
+	subrsOperatorSize := 0
 	if len(localSubrs) > 0 {
-		localSubrsOffset = privateDict.Len() + 5 // Account for the Subrs operator itself
-		// We'll add the Subrs operator at the end of Private DICT
+		// Calculate actual size of Subrs operator entry
+		currentLen := privateDict.Len()
+		estimatedOffset := currentLen + 3
+		encodedSize := len(encodeCFFInt(estimatedOffset)) + 1
+		actualOffset := currentLen + encodedSize
+		if actualOffset != estimatedOffset {
+			encodedSize = len(encodeCFFInt(actualOffset)) + 1
+		}
+		subrsOperatorSize = encodedSize
 	}
 
-	privateDictSize := privateDict.Len()
-	if localSubrsOffset > 0 {
-		privateDictSize += 5 // Space for Subrs offset operator
-	}
+	privateDictSize := privateDict.Len() + subrsOperatorSize
 
 	// Calculate offsets
 	// Header
@@ -234,8 +256,8 @@ func serializeCFF(original *ot.CFF, charStrings [][]byte,
 
 	// Build a minimal Top DICT to calculate its size first
 	topDictEntries := map[int][]int{
-		17: {0}, // CharStrings (placeholder)
-		15: {0}, // charset (placeholder)
+		17: {0},                  // CharStrings (placeholder)
+		15: {0},                  // charset (placeholder)
 		18: {privateDictSize, 0}, // Private (size, offset placeholder)
 	}
 
@@ -246,7 +268,7 @@ func serializeCFF(original *ot.CFF, charStrings [][]byte,
 	offset := headerSize
 	offset += len(nameINDEX)
 
-	_ = offset // topDictOffset not directly used
+	_ = offset                                 // topDictOffset not directly used
 	offset += 2 + 1 + 2 + estimatedTopDictSize // INDEX overhead + data
 
 	offset += len(stringINDEX)
@@ -337,8 +359,21 @@ func serializeCFF(original *ot.CFF, charStrings [][]byte,
 	}
 	if len(localSubrs) > 0 {
 		// Local Subrs offset (relative to start of Private DICT)
-		subrsOffset := privateDict.Len() + 5 // +5 for this operator itself
-		writeDictInt(&privateDict, subrsOffset, 19) // Subrs
+		// We need to calculate the size of the Subrs entry itself
+		// The entry consists of: encoded integer + operator byte(s)
+		currentLen := privateDict.Len()
+		// Estimate the encoded size: for typical offsets (<= 107), it's 1+1=2 bytes
+		// For larger offsets (108-1131), it's 2+1=3 bytes
+		// We'll calculate iteratively to get it right
+		estimatedOffset := currentLen + 3                     // Start with estimate
+		encodedSize := len(encodeCFFInt(estimatedOffset)) + 1 // +1 for operator
+		actualOffset := currentLen + encodedSize
+		// Recalculate if our estimate was wrong
+		if actualOffset != estimatedOffset {
+			encodedSize = len(encodeCFFInt(actualOffset)) + 1
+			actualOffset = currentLen + encodedSize
+		}
+		writeDictInt(&privateDict, actualOffset, 19) // Subrs
 	}
 	buf.Write(privateDict.Bytes())
 

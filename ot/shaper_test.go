@@ -296,10 +296,10 @@ func TestShaperWithFeatures(t *testing.T) {
 
 func TestFeatureFromString(t *testing.T) {
 	tests := []struct {
-		input    string
-		wantTag  Tag
-		wantVal  uint32
-		wantOK   bool
+		input   string
+		wantTag Tag
+		wantVal uint32
+		wantOK  bool
 	}{
 		{"kern", tagFromString("kern"), 1, true},
 		{"kern=1", tagFromString("kern"), 1, true},

@@ -134,8 +134,10 @@ func (p *Plan) computeGlyphClosure() {
 	// Compute composite glyph closure (components)
 	p.computeCompositeGlyphClosure()
 
-	// Compute GSUB closure (unless disabled)
-	if p.input.Flags&FlagNoLayoutClosure == 0 {
+	// Compute GSUB closure (unless disabled or layout tables are dropped)
+	// Skip closure if FlagNoLayoutClosure is set OR if FlagDropLayoutTables is set
+	// (no point adding glyphs reachable only via GSUB if GSUB won't be in the output)
+	if p.input.Flags&FlagNoLayoutClosure == 0 && p.input.Flags&FlagDropLayoutTables == 0 {
 		p.computeGSUBClosure()
 	}
 }

@@ -637,3 +637,202 @@ func (f *cmapFormat14) lookupNonDefault(offset int, cp Codepoint) (GlyphID, bool
 	gid := binary.BigEndian.Uint16(f.data[mapOff+3:])
 	return GlyphID(gid), true
 }
+
+// --- Cmap Iterator ---
+
+// CmapIter iterates over cmap entries.
+type CmapIter interface {
+	Next() bool
+	Char() (rune, GlyphID)
+}
+
+// Iter returns an iterator over all cmap entries.
+func (c *Cmap) Iter() CmapIter {
+	if c.subtable == nil {
+		return &emptyCmapIter{}
+	}
+
+	switch st := c.subtable.(type) {
+	case *cmapFormat0:
+		return &cmapFormat0Iter{f: st, pos: -1}
+	case *cmapFormat4:
+		return &cmapFormat4Iter{f: st, segIdx: 0, charCode: -1}
+	case *cmapFormat6:
+		return &cmapFormat6Iter{f: st, pos: -1}
+	case *cmapFormat12:
+		return &cmapFormat12Iter{f: st, groupIdx: 0, charCode: -1}
+	case *cmapFormat13:
+		return &cmapFormat13Iter{f: st, groupIdx: 0, charCode: -1}
+	}
+	return &emptyCmapIter{}
+}
+
+type emptyCmapIter struct{}
+
+func (e *emptyCmapIter) Next() bool            { return false }
+func (e *emptyCmapIter) Char() (rune, GlyphID) { return 0, 0 }
+
+// Format 0 iterator
+type cmapFormat0Iter struct {
+	f      *cmapFormat0
+	pos    int
+	curGID GlyphID
+}
+
+func (it *cmapFormat0Iter) Next() bool {
+	for {
+		it.pos++
+		if it.pos >= 256 {
+			return false
+		}
+		if it.f.glyphIDs[it.pos] != 0 {
+			it.curGID = GlyphID(it.f.glyphIDs[it.pos])
+			return true
+		}
+	}
+}
+
+func (it *cmapFormat0Iter) Char() (rune, GlyphID) {
+	return rune(it.pos), it.curGID
+}
+
+// Format 4 iterator
+type cmapFormat4Iter struct {
+	f        *cmapFormat4
+	segIdx   int
+	charCode int32
+	curGID   GlyphID
+}
+
+func (it *cmapFormat4Iter) Next() bool {
+	for it.segIdx < it.f.segCount {
+		endCode := int32(it.f.endCodeAt(it.segIdx))
+		startCode := int32(it.f.startCodeAt(it.segIdx))
+
+		// Initialize charCode for new segment
+		if it.charCode < startCode {
+			it.charCode = startCode
+		}
+
+		// Skip 0xFFFF terminator segment
+		if startCode == 0xFFFF {
+			it.segIdx++
+			continue
+		}
+
+		// Iterate within current segment
+		for it.charCode <= endCode {
+			cp := Codepoint(it.charCode)
+			if gid, ok := it.f.Lookup(cp); ok && gid != 0 {
+				it.curGID = gid
+				it.charCode++
+				return true
+			}
+			it.charCode++
+		}
+
+		// Move to next segment
+		it.segIdx++
+		it.charCode = -1
+	}
+	return false
+}
+
+func (it *cmapFormat4Iter) Char() (rune, GlyphID) {
+	return rune(it.charCode - 1), it.curGID
+}
+
+// Format 6 iterator
+type cmapFormat6Iter struct {
+	f      *cmapFormat6
+	pos    int
+	curGID GlyphID
+}
+
+func (it *cmapFormat6Iter) Next() bool {
+	for {
+		it.pos++
+		if it.pos >= len(it.f.glyphIDs) {
+			return false
+		}
+		if it.f.glyphIDs[it.pos] != 0 {
+			it.curGID = GlyphID(it.f.glyphIDs[it.pos])
+			return true
+		}
+	}
+}
+
+func (it *cmapFormat6Iter) Char() (rune, GlyphID) {
+	return rune(int(it.f.firstCode) + it.pos), it.curGID
+}
+
+// Format 12 iterator
+type cmapFormat12Iter struct {
+	f        *cmapFormat12
+	groupIdx int
+	charCode int64
+	curGID   GlyphID
+}
+
+func (it *cmapFormat12Iter) Next() bool {
+	for it.groupIdx < len(it.f.groups) {
+		g := &it.f.groups[it.groupIdx]
+
+		// Initialize charCode for new group
+		if it.charCode < int64(g.startCharCode) {
+			it.charCode = int64(g.startCharCode)
+		}
+
+		// Iterate within current group
+		if it.charCode <= int64(g.endCharCode) {
+			gid := g.startGlyphID + uint32(it.charCode-int64(g.startCharCode))
+			it.curGID = GlyphID(gid)
+			it.charCode++
+			return true
+		}
+
+		// Move to next group
+		it.groupIdx++
+		it.charCode = -1
+	}
+	return false
+}
+
+func (it *cmapFormat12Iter) Char() (rune, GlyphID) {
+	return rune(it.charCode - 1), it.curGID
+}
+
+// Format 13 iterator
+type cmapFormat13Iter struct {
+	f        *cmapFormat13
+	groupIdx int
+	charCode int64
+	curGID   GlyphID
+}
+
+func (it *cmapFormat13Iter) Next() bool {
+	for it.groupIdx < len(it.f.groups) {
+		g := &it.f.groups[it.groupIdx]
+
+		// Initialize charCode for new group
+		if it.charCode < int64(g.startCharCode) {
+			it.charCode = int64(g.startCharCode)
+		}
+
+		// Iterate within current group (all map to same glyph)
+		if it.charCode <= int64(g.endCharCode) {
+			it.curGID = GlyphID(g.startGlyphID)
+			it.charCode++
+			return true
+		}
+
+		// Move to next group
+		it.groupIdx++
+		it.charCode = -1
+	}
+	return false
+}
+
+func (it *cmapFormat13Iter) Char() (rune, GlyphID) {
+	return rune(it.charCode - 1), it.curGID
+}

@@ -209,3 +209,73 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func TestCFFSubsetRetainGIDs(t *testing.T) {
+	fontPath := testutil.FindTestFont("SourceSansPro-Regular.otf")
+	if fontPath == "" {
+		t.Skip("SourceSansPro-Regular.otf not found")
+	}
+
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatalf("Failed to read font: %v", err)
+	}
+
+	font, err := ot.ParseFont(data, 0)
+	if err != nil {
+		t.Fatalf("Failed to parse font: %v", err)
+	}
+
+	// Get GID for 'A'
+	face, _ := ot.NewFace(font)
+	cmap := face.Cmap()
+	aGlyph, _ := cmap.Lookup('A')
+	t.Logf("'A' GlyphID: %d", aGlyph)
+
+	// Subset with RetainGIDs
+	input := NewInput()
+	input.Flags = FlagRetainGIDs
+	input.AddGlyph(0)      // .notdef
+	input.AddGlyph(aGlyph) // 'A'
+
+	plan, err := CreatePlan(font, input)
+	if err != nil {
+		t.Fatalf("Failed to create plan: %v", err)
+	}
+
+	result, err := plan.Execute()
+	if err != nil {
+		t.Fatalf("Failed to execute subset: %v", err)
+	}
+
+	// Verify glyph mapping: with RetainGIDs, old GID should equal new GID
+	glyphMap := plan.GlyphMap()
+	newGID, ok := glyphMap[aGlyph]
+	if !ok {
+		t.Fatalf("'A' not in glyph map")
+	}
+	if newGID != aGlyph {
+		t.Errorf("With FlagRetainGIDs, GID should be unchanged: got %d, want %d", newGID, aGlyph)
+	}
+	t.Logf("'A' mapping with RetainGIDs: %d -> %d", aGlyph, newGID)
+
+	// Parse subset font and verify CFF
+	subFont, err := ot.ParseFont(result, 0)
+	if err != nil {
+		t.Fatalf("Failed to parse subset font: %v", err)
+	}
+
+	subCFFData, _ := subFont.TableData(ot.TagCFF)
+	subCFF, err := ot.ParseCFF(subCFFData)
+	if err != nil {
+		t.Fatalf("Failed to parse subset CFF: %v", err)
+	}
+
+	// With RetainGIDs, glyph count should be at least aGlyph+1 (slots 0 through aGlyph)
+	// Note: GSUB closure may add more glyphs, increasing the max GID
+	minExpectedGlyphs := int(aGlyph) + 1
+	if subCFF.NumGlyphs() < minExpectedGlyphs {
+		t.Errorf("Expected at least %d glyphs with RetainGIDs, got %d", minExpectedGlyphs, subCFF.NumGlyphs())
+	}
+	t.Logf("Subset glyph count with RetainGIDs: %d (min expected: %d)", subCFF.NumGlyphs(), minExpectedGlyphs)
+}

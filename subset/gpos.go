@@ -94,7 +94,7 @@ func (b *gposBuilder) subsetLookup(lookup *ot.GPOSLookup) *gposLookupBuilder {
 			data = b.subsetMarkLigPos(st)
 		case *ot.MarkMarkPos:
 			data = b.subsetMarkMarkPos(st)
-		// TODO: Context, ChainContext
+			// TODO: Context, ChainContext
 		}
 
 		if data != nil && len(data) > 0 {
@@ -322,11 +322,11 @@ func (b *gposBuilder) buildPairPosFormat1(sets []pairSetEntry, vf1, vf2 uint16) 
 	totalSize := headerSize + len(pairSetData) + len(coverage)
 	data := make([]byte, totalSize)
 
-	binary.BigEndian.PutUint16(data[0:], 1)                                    // format
-	binary.BigEndian.PutUint16(data[2:], uint16(headerSize+len(pairSetData)))  // coverage offset
-	binary.BigEndian.PutUint16(data[4:], vf1)                                  // valueFormat1
-	binary.BigEndian.PutUint16(data[6:], vf2)                                  // valueFormat2
-	binary.BigEndian.PutUint16(data[8:], uint16(len(sets)))                    // pairSetCount
+	binary.BigEndian.PutUint16(data[0:], 1)                                   // format
+	binary.BigEndian.PutUint16(data[2:], uint16(headerSize+len(pairSetData))) // coverage offset
+	binary.BigEndian.PutUint16(data[4:], vf1)                                 // valueFormat1
+	binary.BigEndian.PutUint16(data[6:], vf2)                                 // valueFormat2
+	binary.BigEndian.PutUint16(data[8:], uint16(len(sets)))                   // pairSetCount
 
 	for i, off := range pairSetOffsets {
 		binary.BigEndian.PutUint16(data[10+i*2:], off)
