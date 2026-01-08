@@ -34,6 +34,18 @@ type Plan struct {
 	hmtx *ot.Hmtx
 	glyf *ot.Glyf
 	cff  *ot.CFF
+
+	// Variation tables (for instancing)
+	fvar *ot.Fvar
+	avar *ot.Avar
+	hvar *ot.Hvar
+	gvar *ot.Gvar
+
+	// Instanced advance widths (computed when axes are pinned)
+	instancedAdvances map[ot.GlyphID]uint16
+
+	// Normalized coordinates for instancing (F2DOT14 format)
+	normalizedCoords []int
 }
 
 // CreatePlan creates a subset plan from a font and input configuration.
@@ -57,6 +69,11 @@ func CreatePlan(font *ot.Font, input *Input) (*Plan, error) {
 
 	// Create glyph mapping
 	p.createGlyphMapping()
+
+	// Compute instanced advances if axes are pinned
+	if input.HasPinnedAxes() {
+		p.computeInstancedAdvances()
+	}
 
 	return p, nil
 }
@@ -107,6 +124,24 @@ func (p *Plan) parseTables() error {
 	if p.source.HasTable(ot.TagCFF) {
 		data, _ := p.source.TableData(ot.TagCFF)
 		p.cff, _ = ot.ParseCFF(data)
+	}
+
+	// Parse variation tables (for instancing)
+	if p.source.HasTable(ot.TagFvar) {
+		data, _ := p.source.TableData(ot.TagFvar)
+		p.fvar, _ = ot.ParseFvar(data)
+	}
+	if p.source.HasTable(ot.TagAvar) {
+		data, _ := p.source.TableData(ot.TagAvar)
+		p.avar, _ = ot.ParseAvar(data)
+	}
+	if p.source.HasTable(ot.TagHvar) {
+		data, _ := p.source.TableData(ot.TagHvar)
+		p.hvar, _ = ot.ParseHvar(data)
+	}
+	if p.source.HasTable(ot.TagGvar) {
+		data, _ := p.source.TableData(ot.TagGvar)
+		p.gvar, _ = ot.ParseGvar(data)
 	}
 
 	return nil
@@ -367,4 +402,129 @@ func (p *Plan) GlyphMap() map[ot.GlyphID]ot.GlyphID {
 // CFF returns the parsed CFF table.
 func (p *Plan) CFF() *ot.CFF {
 	return p.cff
+}
+
+// Fvar returns the parsed fvar table.
+func (p *Plan) Fvar() *ot.Fvar {
+	return p.fvar
+}
+
+// IsInstanced returns true if the plan will produce an instanced (static) font.
+func (p *Plan) IsInstanced() bool {
+	return p.input.HasPinnedAxes() && p.instancedAdvances != nil
+}
+
+// computeInstancedAdvances computes advance widths with HVAR deltas applied.
+func (p *Plan) computeInstancedAdvances() {
+	if p.fvar == nil || p.hmtx == nil {
+		return
+	}
+
+	// Build normalized coordinates from pinned axes
+	axisCount := p.fvar.AxisCount()
+	normalizedCoords := make([]float32, axisCount)
+	axes := p.fvar.AxisInfos()
+
+	for i, axis := range axes {
+		if value, pinned := p.input.pinnedAxes[axis.Tag]; pinned {
+			normalizedCoords[i] = p.fvar.NormalizeAxisValue(i, value)
+		}
+		// Unpinned axes stay at 0 (default)
+	}
+
+	// Convert to F2DOT14 format and apply avar mapping
+	normalizedCoordsI := make([]int, axisCount)
+	for i, v := range normalizedCoords {
+		normalizedCoordsI[i] = floatToF2DOT14(v)
+	}
+	if p.avar != nil && p.avar.HasData() {
+		normalizedCoordsI = p.avar.MapCoords(normalizedCoordsI)
+	}
+
+	// Save normalized coordinates for gvar instancing
+	p.normalizedCoords = normalizedCoordsI
+
+	// Compute instanced advances for all glyphs in the subset
+	p.instancedAdvances = make(map[ot.GlyphID]uint16)
+
+	for oldGID := range p.glyphSet {
+		baseAdvance := p.hmtx.GetAdvanceWidth(oldGID)
+
+		// Apply HVAR delta if available
+		if p.hvar != nil && p.hvar.HasData() {
+			delta := p.hvar.GetAdvanceDelta(oldGID, normalizedCoordsI)
+			baseAdvance = uint16(int32(baseAdvance) + roundToInt(delta))
+		}
+
+		p.instancedAdvances[oldGID] = baseAdvance
+	}
+}
+
+// GetGlyphDeltas returns the gvar deltas for a glyph at the pinned coordinates.
+// numPoints is the number of outline points in the glyph.
+// This version doesn't support proper IUP interpolation.
+func (p *Plan) GetGlyphDeltas(gid ot.GlyphID, numPoints int) (xDeltas, yDeltas []int16) {
+	return p.GetGlyphDeltasWithCoords(gid, numPoints, nil)
+}
+
+// GetGlyphDeltasWithCoords returns the gvar deltas for a glyph at the pinned coordinates
+// with proper IUP interpolation using the original point coordinates.
+func (p *Plan) GetGlyphDeltasWithCoords(gid ot.GlyphID, numPoints int, origPoints []ot.SimpleGlyphPoint) (xDeltas, yDeltas []int16) {
+	if p.gvar == nil || !p.gvar.HasData() || p.normalizedCoords == nil {
+		return nil, nil
+	}
+
+	// Add 4 phantom points (standard for TrueType)
+	totalPoints := numPoints + 4
+
+	// Convert SimpleGlyphPoint to GlyphPoint for IUP
+	var origCoords []ot.GlyphPoint
+	if origPoints != nil {
+		origCoords = make([]ot.GlyphPoint, len(origPoints)+4) // +4 for phantom points
+		for i, p := range origPoints {
+			origCoords[i] = ot.GlyphPoint{X: p.X, Y: p.Y}
+		}
+		// Phantom points are at indices [numPoints:numPoints+4], initialize with zeros
+	}
+
+	deltas := p.gvar.GetGlyphDeltasWithCoords(gid, p.normalizedCoords, totalPoints, origCoords)
+	if deltas == nil {
+		return nil, nil
+	}
+
+	// Return only the outline point deltas (not phantom points)
+	if len(deltas.XDeltas) >= numPoints {
+		return deltas.XDeltas[:numPoints], deltas.YDeltas[:numPoints]
+	}
+	return deltas.XDeltas, deltas.YDeltas
+}
+
+// GetInstancedAdvance returns the instanced advance width for a glyph.
+// If not instanced, returns the base advance from hmtx.
+func (p *Plan) GetInstancedAdvance(oldGID ot.GlyphID) uint16 {
+	if p.instancedAdvances != nil {
+		if adv, ok := p.instancedAdvances[oldGID]; ok {
+			return adv
+		}
+	}
+	if p.hmtx != nil {
+		return p.hmtx.GetAdvanceWidth(oldGID)
+	}
+	return 0
+}
+
+// floatToF2DOT14 converts a float32 in range [-1, 1] to F2DOT14 format.
+func floatToF2DOT14(v float32) int {
+	if v >= 0 {
+		return int(v*16384 + 0.5)
+	}
+	return int(v*16384 - 0.5)
+}
+
+// roundToInt rounds a float32 to the nearest int32.
+func roundToInt(v float32) int32 {
+	if v >= 0 {
+		return int32(v + 0.5)
+	}
+	return int32(v - 0.5)
 }

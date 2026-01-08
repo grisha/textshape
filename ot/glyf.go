@@ -316,6 +316,301 @@ func BuildLoca(offsets []uint32, useShort bool) []byte {
 	return data
 }
 
+// SimpleGlyphPoint represents a point in a simple glyph outline.
+type SimpleGlyphPoint struct {
+	X       int16
+	Y       int16
+	OnCurve bool
+}
+
+// ParseSimpleGlyph parses a simple glyph and returns its points.
+// This includes phantom points (4 points at the end for metrics).
+func ParseSimpleGlyph(data []byte) ([]SimpleGlyphPoint, int, error) {
+	if len(data) < 10 {
+		return nil, 0, ErrInvalidTable
+	}
+
+	numberOfContours := int16(binary.BigEndian.Uint16(data[0:]))
+	if numberOfContours < 0 {
+		// Composite glyph - not handled here
+		return nil, 0, ErrInvalidFormat
+	}
+
+	if numberOfContours == 0 {
+		// Empty glyph (like space)
+		return nil, 0, nil
+	}
+
+	offset := 10 // Skip header
+
+	// Read endPtsOfContours
+	if offset+int(numberOfContours)*2 > len(data) {
+		return nil, 0, ErrInvalidOffset
+	}
+
+	var numPoints int
+	for i := 0; i < int(numberOfContours); i++ {
+		endPt := int(binary.BigEndian.Uint16(data[offset+i*2:]))
+		if endPt+1 > numPoints {
+			numPoints = endPt + 1
+		}
+	}
+	offset += int(numberOfContours) * 2
+
+	// Read instructionLength
+	if offset+2 > len(data) {
+		return nil, 0, ErrInvalidOffset
+	}
+	instructionLength := int(binary.BigEndian.Uint16(data[offset:]))
+	offset += 2
+
+	// Skip instructions
+	offset += instructionLength
+	if offset > len(data) {
+		return nil, 0, ErrInvalidOffset
+	}
+
+	// Parse flags
+	flags := make([]byte, numPoints)
+	for i := 0; i < numPoints; {
+		if offset >= len(data) {
+			return nil, 0, ErrInvalidOffset
+		}
+		flag := data[offset]
+		offset++
+		flags[i] = flag
+		i++
+
+		// Check for repeat flag
+		if flag&0x08 != 0 {
+			if offset >= len(data) {
+				return nil, 0, ErrInvalidOffset
+			}
+			repeatCount := int(data[offset])
+			offset++
+			for j := 0; j < repeatCount && i < numPoints; j++ {
+				flags[i] = flag
+				i++
+			}
+		}
+	}
+
+	// Parse X coordinates
+	points := make([]SimpleGlyphPoint, numPoints)
+	var x int16 = 0
+	for i := 0; i < numPoints; i++ {
+		flag := flags[i]
+		xShort := (flag & 0x02) != 0
+		xSame := (flag & 0x10) != 0
+
+		if xShort {
+			if offset >= len(data) {
+				return nil, 0, ErrInvalidOffset
+			}
+			if xSame {
+				x += int16(data[offset])
+			} else {
+				x -= int16(data[offset])
+			}
+			offset++
+		} else {
+			if !xSame {
+				if offset+2 > len(data) {
+					return nil, 0, ErrInvalidOffset
+				}
+				x += int16(binary.BigEndian.Uint16(data[offset:]))
+				offset += 2
+			}
+			// else: x is unchanged (same as previous)
+		}
+		points[i].X = x
+		points[i].OnCurve = (flag & 0x01) != 0
+	}
+
+	// Parse Y coordinates
+	var y int16 = 0
+	for i := 0; i < numPoints; i++ {
+		flag := flags[i]
+		yShort := (flag & 0x04) != 0
+		ySame := (flag & 0x20) != 0
+
+		if yShort {
+			if offset >= len(data) {
+				return nil, 0, ErrInvalidOffset
+			}
+			if ySame {
+				y += int16(data[offset])
+			} else {
+				y -= int16(data[offset])
+			}
+			offset++
+		} else {
+			if !ySame {
+				if offset+2 > len(data) {
+					return nil, 0, ErrInvalidOffset
+				}
+				y += int16(binary.BigEndian.Uint16(data[offset:]))
+				offset += 2
+			}
+		}
+		points[i].Y = y
+	}
+
+	return points, int(numberOfContours), nil
+}
+
+// InstanceSimpleGlyph creates a new glyph with deltas applied to points.
+func InstanceSimpleGlyph(data []byte, xDeltas, yDeltas []int16) []byte {
+	if len(data) < 10 {
+		return data
+	}
+
+	numberOfContours := int16(binary.BigEndian.Uint16(data[0:]))
+	if numberOfContours <= 0 {
+		// Composite or empty glyph - return unchanged
+		return data
+	}
+
+	// Parse the original glyph
+	points, numContours, err := ParseSimpleGlyph(data)
+	if err != nil || len(points) == 0 {
+		return data
+	}
+
+	// Apply deltas to points
+	for i := 0; i < len(points) && i < len(xDeltas); i++ {
+		points[i].X += xDeltas[i]
+		points[i].Y += yDeltas[i]
+	}
+
+	// Re-encode the glyph
+	return encodeSimpleGlyph(data, points, numContours)
+}
+
+// encodeSimpleGlyph re-encodes a simple glyph with modified points.
+func encodeSimpleGlyph(originalData []byte, points []SimpleGlyphPoint, numContours int) []byte {
+	if len(originalData) < 10 {
+		return originalData
+	}
+
+	// Calculate new bounding box
+	var xMin, yMin, xMax, yMax int16
+	if len(points) > 0 {
+		xMin, yMin = points[0].X, points[0].Y
+		xMax, yMax = points[0].X, points[0].Y
+		for _, p := range points[1:] {
+			if p.X < xMin {
+				xMin = p.X
+			}
+			if p.X > xMax {
+				xMax = p.X
+			}
+			if p.Y < yMin {
+				yMin = p.Y
+			}
+			if p.Y > yMax {
+				yMax = p.Y
+			}
+		}
+	}
+
+	// Read endPtsOfContours from original
+	endPtsOfContours := make([]uint16, numContours)
+	for i := 0; i < numContours; i++ {
+		endPtsOfContours[i] = binary.BigEndian.Uint16(originalData[10+i*2:])
+	}
+
+	// Read instructions from original
+	instrOffset := 10 + numContours*2
+	if instrOffset+2 > len(originalData) {
+		return originalData
+	}
+	instructionLength := int(binary.BigEndian.Uint16(originalData[instrOffset:]))
+	var instructions []byte
+	if instructionLength > 0 && instrOffset+2+instructionLength <= len(originalData) {
+		instructions = originalData[instrOffset+2 : instrOffset+2+instructionLength]
+	}
+
+	// Build new glyph data
+	var result []byte
+
+	// Header
+	header := make([]byte, 10)
+	binary.BigEndian.PutUint16(header[0:], uint16(numContours))
+	binary.BigEndian.PutUint16(header[2:], uint16(xMin))
+	binary.BigEndian.PutUint16(header[4:], uint16(yMin))
+	binary.BigEndian.PutUint16(header[6:], uint16(xMax))
+	binary.BigEndian.PutUint16(header[8:], uint16(yMax))
+	result = append(result, header...)
+
+	// endPtsOfContours
+	for _, endPt := range endPtsOfContours {
+		result = append(result, byte(endPt>>8), byte(endPt))
+	}
+
+	// Instructions
+	result = append(result, byte(instructionLength>>8), byte(instructionLength))
+	result = append(result, instructions...)
+
+	// Encode flags and coordinates
+	// Use simple encoding (no repeat flags, may be larger but correct)
+	flags := make([]byte, len(points))
+	var xCoords, yCoords []byte
+
+	var lastX, lastY int16 = 0, 0
+	for i, p := range points {
+		var flag byte
+		if p.OnCurve {
+			flag |= 0x01
+		}
+
+		dx := p.X - lastX
+		dy := p.Y - lastY
+
+		// Encode X
+		if dx == 0 {
+			flag |= 0x10 // xIsSame
+		} else if dx >= -255 && dx <= 255 {
+			flag |= 0x02 // xShort
+			if dx > 0 {
+				flag |= 0x10 // positive
+				xCoords = append(xCoords, byte(dx))
+			} else {
+				xCoords = append(xCoords, byte(-dx))
+			}
+		} else {
+			// xLong
+			xCoords = append(xCoords, byte(dx>>8), byte(dx))
+		}
+
+		// Encode Y
+		if dy == 0 {
+			flag |= 0x20 // yIsSame
+		} else if dy >= -255 && dy <= 255 {
+			flag |= 0x04 // yShort
+			if dy > 0 {
+				flag |= 0x20 // positive
+				yCoords = append(yCoords, byte(dy))
+			} else {
+				yCoords = append(yCoords, byte(-dy))
+			}
+		} else {
+			// yLong
+			yCoords = append(yCoords, byte(dy>>8), byte(dy))
+		}
+
+		flags[i] = flag
+		lastX = p.X
+		lastY = p.Y
+	}
+
+	result = append(result, flags...)
+	result = append(result, xCoords...)
+	result = append(result, yCoords...)
+
+	return result
+}
+
 // ParseGlyfFromFont parses both glyf and loca tables from a font.
 func ParseGlyfFromFont(font *Font) (*Glyf, error) {
 	// Get numGlyphs from maxp

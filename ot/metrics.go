@@ -306,6 +306,7 @@ type Face struct {
 	post  *Post
 	name  *Name
 	cmap  *Cmap
+	fvar  *Fvar
 	upem  uint16
 	isCFF bool
 }
@@ -359,6 +360,11 @@ func NewFace(font *Font) (*Face, error) {
 
 	// Check if CFF font
 	f.isCFF = font.HasTable(TagCFF)
+
+	// Parse fvar (variable fonts)
+	if data, err := font.TableData(TagFvar); err == nil {
+		f.fvar, _ = ParseFvar(data)
+	}
 
 	return f, nil
 }
@@ -500,6 +506,44 @@ func LoadFace(r io.Reader, index int) (*Face, error) {
 		return nil, err
 	}
 	return NewFace(font)
+}
+
+// --- Variable Font Methods ---
+
+// HasVariations returns true if the font is a variable font.
+func (f *Face) HasVariations() bool {
+	return f.fvar.HasData()
+}
+
+// VariationAxes returns information about all variation axes.
+// Returns nil for non-variable fonts.
+func (f *Face) VariationAxes() []AxisInfo {
+	if f.fvar == nil {
+		return nil
+	}
+	return f.fvar.AxisInfos()
+}
+
+// FindVariationAxis finds a variation axis by its tag.
+func (f *Face) FindVariationAxis(tag Tag) (AxisInfo, bool) {
+	if f.fvar == nil {
+		return AxisInfo{}, false
+	}
+	return f.fvar.FindAxis(tag)
+}
+
+// NamedInstances returns all named instances (e.g., "Bold", "Light").
+// Returns nil for non-variable fonts.
+func (f *Face) NamedInstances() []NamedInstance {
+	if f.fvar == nil {
+		return nil
+	}
+	return f.fvar.NamedInstances()
+}
+
+// Fvar returns the parsed fvar table, or nil if not present.
+func (f *Face) Fvar() *Fvar {
+	return f.fvar
 }
 
 // LoadFaceFromData loads a font from byte data and returns a Face.

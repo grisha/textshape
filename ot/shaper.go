@@ -158,9 +158,17 @@ type Shaper struct {
 	gsub *GSUB
 	gpos *GPOS
 	hmtx *Hmtx
+	fvar *Fvar
+	avar *Avar
+	hvar *Hvar
 
 	// Default features to apply when nil is passed to Shape
 	defaultFeatures []Feature
+
+	// Variation state (for variable fonts)
+	designCoords      []float32 // User-space coordinates
+	normalizedCoords  []float32 // Normalized coordinates [-1, 1]
+	normalizedCoordsI []int     // Normalized coords in F2DOT14 format, after avar mapping
 }
 
 // NewShaper creates a shaper from a parsed font.
@@ -210,6 +218,41 @@ func NewShaper(font *Font) (*Shaper, error) {
 		s.hmtx, _ = ParseHmtxFromFont(font)
 	}
 
+	// Parse fvar (variable fonts)
+	if font.HasTable(TagFvar) {
+		data, err := font.TableData(TagFvar)
+		if err == nil {
+			s.fvar, _ = ParseFvar(data)
+			// Initialize variation coords to defaults (all zeros = default position)
+			if s.fvar != nil && s.fvar.AxisCount() > 0 {
+				axisCount := s.fvar.AxisCount()
+				s.designCoords = make([]float32, axisCount)
+				s.normalizedCoords = make([]float32, axisCount)
+				s.normalizedCoordsI = make([]int, axisCount)
+				// Set design coords to default values
+				for i, axis := range s.fvar.AxisInfos() {
+					s.designCoords[i] = axis.DefaultValue
+				}
+			}
+		}
+	}
+
+	// Parse avar (axis variations mapping)
+	if font.HasTable(TagAvar) {
+		data, err := font.TableData(TagAvar)
+		if err == nil {
+			s.avar, _ = ParseAvar(data)
+		}
+	}
+
+	// Parse HVAR (horizontal metrics variations)
+	if font.HasTable(TagHvar) {
+		data, err := font.TableData(TagHvar)
+		if err == nil {
+			s.hvar, _ = ParseHvar(data)
+		}
+	}
+
 	// Set default features
 	s.defaultFeatures = DefaultFeatures()
 
@@ -217,6 +260,134 @@ func NewShaper(font *Font) (*Shaper, error) {
 }
 
 // Note: TagKern, TagMark, TagMkmk are defined in gpos.go
+
+// --- Variable Font Methods ---
+
+// HasVariations returns true if the font is a variable font.
+func (s *Shaper) HasVariations() bool {
+	return s.fvar != nil && s.fvar.HasData()
+}
+
+// SetVariations sets the variation axis values.
+// This overrides all existing variations. Axes not included will be set to their default values.
+func (s *Shaper) SetVariations(variations []Variation) {
+	if s.fvar == nil || s.fvar.AxisCount() == 0 {
+		return
+	}
+
+	axisCount := s.fvar.AxisCount()
+	axes := s.fvar.AxisInfos()
+
+	// Reset to defaults
+	for i := 0; i < axisCount; i++ {
+		s.designCoords[i] = axes[i].DefaultValue
+		s.normalizedCoords[i] = 0
+		s.normalizedCoordsI[i] = 0
+	}
+
+	// Apply specified variations
+	for _, v := range variations {
+		for i := 0; i < axisCount; i++ {
+			if axes[i].Tag == v.Tag {
+				s.designCoords[i] = clampFloat32(v.Value, axes[i].MinValue, axes[i].MaxValue)
+				s.normalizedCoords[i] = s.fvar.NormalizeAxisValue(i, v.Value)
+				s.normalizedCoordsI[i] = floatToF2DOT14(s.normalizedCoords[i])
+				break
+			}
+		}
+	}
+
+	// Apply avar mapping
+	s.applyAvarMapping()
+}
+
+// SetVariation sets a single variation axis value.
+// Note: This is less efficient than SetVariations for setting multiple axes.
+func (s *Shaper) SetVariation(tag Tag, value float32) {
+	if s.fvar == nil || s.fvar.AxisCount() == 0 {
+		return
+	}
+
+	axes := s.fvar.AxisInfos()
+	for i, axis := range axes {
+		if axis.Tag == tag {
+			s.designCoords[i] = clampFloat32(value, axis.MinValue, axis.MaxValue)
+			s.normalizedCoords[i] = s.fvar.NormalizeAxisValue(i, value)
+			s.normalizedCoordsI[i] = floatToF2DOT14(s.normalizedCoords[i])
+			// Apply avar mapping
+			s.applyAvarMapping()
+			return
+		}
+	}
+}
+
+// SetNamedInstance sets the variation to a named instance (e.g., "Bold", "Light").
+func (s *Shaper) SetNamedInstance(index int) {
+	if s.fvar == nil {
+		return
+	}
+
+	instance, ok := s.fvar.NamedInstanceAt(index)
+	if !ok {
+		return
+	}
+
+	// Copy instance coordinates
+	axisCount := s.fvar.AxisCount()
+	for i := 0; i < axisCount && i < len(instance.Coords); i++ {
+		s.designCoords[i] = instance.Coords[i]
+		s.normalizedCoords[i] = s.fvar.NormalizeAxisValue(i, instance.Coords[i])
+		s.normalizedCoordsI[i] = floatToF2DOT14(s.normalizedCoords[i])
+	}
+
+	// Apply avar mapping
+	s.applyAvarMapping()
+}
+
+// DesignCoords returns the current design-space coordinates.
+// Returns nil for non-variable fonts.
+func (s *Shaper) DesignCoords() []float32 {
+	if s.designCoords == nil {
+		return nil
+	}
+	result := make([]float32, len(s.designCoords))
+	copy(result, s.designCoords)
+	return result
+}
+
+// NormalizedCoords returns the current normalized coordinates (range [-1, 1]).
+// Returns nil for non-variable fonts.
+func (s *Shaper) NormalizedCoords() []float32 {
+	if s.normalizedCoords == nil {
+		return nil
+	}
+	result := make([]float32, len(s.normalizedCoords))
+	copy(result, s.normalizedCoords)
+	return result
+}
+
+// Fvar returns the parsed fvar table, or nil if not present.
+func (s *Shaper) Fvar() *Fvar {
+	return s.fvar
+}
+
+// Hvar returns the parsed HVAR table, or nil if not present.
+func (s *Shaper) Hvar() *Hvar {
+	return s.hvar
+}
+
+// HasHvar returns true if the font has HVAR data for variable advances.
+func (s *Shaper) HasHvar() bool {
+	return s.hvar != nil && s.hvar.HasData()
+}
+
+// applyAvarMapping applies avar non-linear mapping to normalizedCoordsI.
+func (s *Shaper) applyAvarMapping() {
+	if s.avar == nil || !s.avar.HasData() {
+		return
+	}
+	s.normalizedCoordsI = s.avar.MapCoords(s.normalizedCoordsI)
+}
 
 // Shape shapes the text in the buffer using the specified features.
 // If features is nil, default features are used.
@@ -309,15 +480,34 @@ func (s *Shaper) setGlyphClasses(buf *Buffer) {
 }
 
 // setBaseAdvances sets the base advance widths from hmtx.
+// For variable fonts, it also applies HVAR deltas.
 func (s *Shaper) setBaseAdvances(buf *Buffer) {
 	if s.hmtx == nil {
 		return
 	}
 
+	// Check if we need to apply HVAR deltas
+	applyHvar := s.hvar != nil && s.hvar.HasData() && s.normalizedCoordsI != nil
+
 	for i := range buf.Info {
 		adv := s.hmtx.GetAdvanceWidth(buf.Info[i].GlyphID)
+
+		// Apply HVAR delta if available
+		if applyHvar {
+			delta := s.hvar.GetAdvanceDelta(buf.Info[i].GlyphID, s.normalizedCoordsI)
+			adv = uint16(int32(adv) + roundToInt(delta))
+		}
+
 		buf.Pos[i].XAdvance = int16(adv)
 	}
+}
+
+// roundToInt rounds a float32 to the nearest int32.
+func roundToInt(v float32) int32 {
+	if v >= 0 {
+		return int32(v + 0.5)
+	}
+	return int32(v - 0.5)
 }
 
 // applyGSUB applies GSUB features to the buffer.

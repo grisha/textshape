@@ -563,6 +563,229 @@ func TestSubsetAllLigatures(t *testing.T) {
 	t.Logf("All 4 ligatures work: %d glyphs", len(subGlyphs))
 }
 
+// TestInstancingDropsVariationTables tests that variation tables are dropped when axes are pinned.
+func TestInstancingDropsVariationTables(t *testing.T) {
+	fontPath := findTestFont("Roboto-Variable.ttf")
+	if fontPath == "" {
+		t.Skip("Roboto-Variable.ttf not found")
+	}
+
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatalf("Failed to read font: %v", err)
+	}
+
+	font, err := ot.ParseFont(data, 0)
+	if err != nil {
+		t.Fatalf("Failed to parse font: %v", err)
+	}
+
+	// Verify original font has variation tables
+	variationTables := []ot.Tag{ot.TagFvar, ot.TagHvar}
+	for _, tag := range variationTables {
+		if !font.HasTable(tag) {
+			t.Skipf("Font has no %v table", tag)
+		}
+	}
+
+	// First subset WITHOUT pinning - should keep variation tables (with FlagPassUnrecognized)
+	input1 := NewInput()
+	input1.AddString("Hello")
+	input1.Flags = FlagPassUnrecognized
+	plan1, err := CreatePlan(font, input1)
+	if err != nil {
+		t.Fatalf("Failed to create plan: %v", err)
+	}
+	result1, err := plan1.Execute()
+	if err != nil {
+		t.Fatalf("Failed to execute plan: %v", err)
+	}
+	subFont1, _ := ot.ParseFont(result1, 0)
+
+	// Should have fvar table (not instanced)
+	if !subFont1.HasTable(ot.TagFvar) {
+		t.Error("Non-instanced subset with FlagPassUnrecognized should have fvar table")
+	}
+
+	// Now subset WITH pinning all axes - should drop variation tables
+	input2 := NewInput()
+	input2.AddString("Hello")
+	input2.Flags = FlagPassUnrecognized
+	input2.PinAllAxesToDefault(font)
+
+	plan2, err := CreatePlan(font, input2)
+	if err != nil {
+		t.Fatalf("Failed to create plan: %v", err)
+	}
+	result2, err := plan2.Execute()
+	if err != nil {
+		t.Fatalf("Failed to execute plan: %v", err)
+	}
+	subFont2, _ := ot.ParseFont(result2, 0)
+
+	// Should NOT have variation tables
+	if subFont2.HasTable(ot.TagFvar) {
+		t.Error("Instanced subset should NOT have fvar table")
+	}
+	if subFont2.HasTable(ot.TagHvar) {
+		t.Error("Instanced subset should NOT have HVAR table")
+	}
+	if subFont2.HasTable(ot.TagAvar) {
+		t.Error("Instanced subset should NOT have avar table")
+	}
+
+	t.Logf("Non-instanced: %d bytes, Instanced: %d bytes", len(result1), len(result2))
+	t.Logf("Saved: %d bytes", len(result1)-len(result2))
+}
+
+// TestInstancingAppliesHVAR tests that HVAR deltas are applied when instancing.
+func TestInstancingAppliesHVAR(t *testing.T) {
+	fontPath := findTestFont("Roboto-Variable.ttf")
+	if fontPath == "" {
+		t.Skip("Roboto-Variable.ttf not found")
+	}
+
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatalf("Failed to read font: %v", err)
+	}
+
+	font, err := ot.ParseFont(data, 0)
+	if err != nil {
+		t.Fatalf("Failed to parse font: %v", err)
+	}
+
+	// Expected advances from hb-shape at different weights for "Hello"
+	// These are the same values from ot/hvar_compare_test.go
+	expectedAdvances := map[float32][]int16{
+		100: {1438, 1032, 422, 422, 1127},
+		400: {1461, 1086, 498, 498, 1168},
+		700: {1446, 1106, 542, 542, 1156},
+		900: {1439, 1116, 563, 563, 1151},
+	}
+
+	for weight, expected := range expectedAdvances {
+		t.Run(fmt.Sprintf("weight%.0f", weight), func(t *testing.T) {
+			// Create instanced subset at this weight
+			input := NewInput()
+			input.AddString("Hello")
+			input.PinAxisLocation(ot.TagAxisWeight, weight)
+
+			plan, err := CreatePlan(font, input)
+			if err != nil {
+				t.Fatalf("Failed to create plan: %v", err)
+			}
+
+			// Verify it's marked as instanced
+			if !plan.IsInstanced() {
+				t.Fatal("Plan should be marked as instanced")
+			}
+
+			result, err := plan.Execute()
+			if err != nil {
+				t.Fatalf("Failed to execute plan: %v", err)
+			}
+
+			// Parse the subset font
+			subFont, err := ot.ParseFont(result, 0)
+			if err != nil {
+				t.Fatalf("Failed to parse subset font: %v", err)
+			}
+
+			// Shape "Hello" - since it's a static font now, should give correct advances
+			shaper, err := ot.NewShaper(subFont)
+			if err != nil {
+				t.Fatalf("Failed to create shaper: %v", err)
+			}
+
+			buf := ot.NewBuffer()
+			buf.AddString("Hello")
+			shaper.Shape(buf, nil)
+
+			// Compare advances
+			match := true
+			for i, pos := range buf.Pos {
+				if pos.XAdvance != expected[i] {
+					t.Errorf("Glyph %d: advance=%d, expected=%d", i, pos.XAdvance, expected[i])
+					match = false
+				}
+			}
+			if match {
+				t.Logf("OK: advances match hb-shape at wght=%.0f", weight)
+			}
+		})
+	}
+}
+
+// TestPinAxisMethods tests the Input pin axis methods.
+func TestPinAxisMethods(t *testing.T) {
+	fontPath := findTestFont("Roboto-Variable.ttf")
+	if fontPath == "" {
+		t.Skip("Roboto-Variable.ttf not found")
+	}
+
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatalf("Failed to read font: %v", err)
+	}
+
+	font, err := ot.ParseFont(data, 0)
+	if err != nil {
+		t.Fatalf("Failed to parse font: %v", err)
+	}
+
+	// Test PinAxisLocation
+	t.Run("PinAxisLocation", func(t *testing.T) {
+		input := NewInput()
+		input.PinAxisLocation(ot.TagAxisWeight, 700)
+
+		if !input.HasPinnedAxes() {
+			t.Error("HasPinnedAxes should return true")
+		}
+
+		pinnedAxes := input.PinnedAxes()
+		if pinnedAxes[ot.TagAxisWeight] != 700 {
+			t.Errorf("PinnedAxes[wght] = %v, expected 700", pinnedAxes[ot.TagAxisWeight])
+		}
+
+		if input.IsFullyInstanced(font) {
+			t.Error("Should not be fully instanced (only one axis pinned)")
+		}
+	})
+
+	// Test PinAxisToDefault
+	t.Run("PinAxisToDefault", func(t *testing.T) {
+		input := NewInput()
+		ok := input.PinAxisToDefault(font, ot.TagAxisWeight)
+		if !ok {
+			t.Fatal("PinAxisToDefault should return true")
+		}
+
+		pinnedAxes := input.PinnedAxes()
+		// Roboto-Variable default weight is 400
+		if pinnedAxes[ot.TagAxisWeight] != 400 {
+			t.Errorf("Default weight = %v, expected 400", pinnedAxes[ot.TagAxisWeight])
+		}
+	})
+
+	// Test PinAllAxesToDefault
+	t.Run("PinAllAxesToDefault", func(t *testing.T) {
+		input := NewInput()
+		ok := input.PinAllAxesToDefault(font)
+		if !ok {
+			t.Fatal("PinAllAxesToDefault should return true")
+		}
+
+		if !input.HasPinnedAxes() {
+			t.Error("HasPinnedAxes should return true")
+		}
+
+		if !input.IsFullyInstanced(font) {
+			t.Error("Should be fully instanced (all axes pinned)")
+		}
+	})
+}
+
 // TestFlagDropLayoutTables tests that layout tables are excluded when flag is set.
 func TestFlagDropLayoutTables(t *testing.T) {
 	fontPath := findTestFont("Roboto-Regular.ttf")

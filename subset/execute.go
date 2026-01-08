@@ -135,6 +135,7 @@ func (p *Plan) subsetHhea(builder *FontBuilder) error {
 }
 
 // subsetHmtx subsets the hmtx table.
+// When axes are pinned (instancing), HVAR deltas are applied to the advances.
 func (p *Plan) subsetHmtx(builder *FontBuilder) error {
 	if p.hmtx == nil {
 		return ErrMissingTable
@@ -150,7 +151,15 @@ func (p *Plan) subsetHmtx(builder *FontBuilder) error {
 			continue
 		}
 
-		advance, lsb := p.hmtx.GetMetrics(oldGID)
+		// Use instanced advance if available (includes HVAR deltas)
+		var advance uint16
+		if p.IsInstanced() {
+			advance = p.GetInstancedAdvance(oldGID)
+		} else {
+			advance = p.hmtx.GetAdvanceWidth(oldGID)
+		}
+		_, lsb := p.hmtx.GetMetrics(oldGID)
+
 		off := newGID * 4
 		binary.BigEndian.PutUint16(newData[off:], advance)
 		binary.BigEndian.PutUint16(newData[off+2:], uint16(lsb))
@@ -161,6 +170,7 @@ func (p *Plan) subsetHmtx(builder *FontBuilder) error {
 }
 
 // subsetGlyf subsets the glyf and loca tables.
+// When instancing (axes are pinned), gvar deltas are applied to glyph outlines.
 func (p *Plan) subsetGlyf(builder *FontBuilder) error {
 	if p.glyf == nil {
 		return ErrMissingTable
@@ -182,6 +192,24 @@ func (p *Plan) subsetGlyf(builder *FontBuilder) error {
 		glyphBytes := p.glyf.GetGlyphBytes(oldGID)
 		if glyphBytes == nil {
 			continue
+		}
+
+		// Apply gvar deltas when instancing
+		if p.IsInstanced() && len(glyphBytes) >= 10 {
+			numberOfContours := int16(glyphBytes[0])<<8 | int16(glyphBytes[1])
+			if numberOfContours > 0 {
+				// Simple glyph - parse points and apply deltas
+				points, _, err := ot.ParseSimpleGlyph(glyphBytes)
+				if err == nil && len(points) > 0 {
+					// Use GetGlyphDeltasWithCoords for proper IUP interpolation
+					xDeltas, yDeltas := p.GetGlyphDeltasWithCoords(oldGID, len(points), points)
+					if xDeltas != nil && yDeltas != nil {
+						glyphBytes = ot.InstanceSimpleGlyph(glyphBytes, xDeltas, yDeltas)
+					}
+				}
+			}
+			// Composite glyphs: component transforms may need adjustment
+			// but for now we just pass them through unchanged
 		}
 
 		// Remap composite glyph component IDs
@@ -471,6 +499,34 @@ func (p *Plan) handleOptionalTables(builder *FontBuilder) {
 			builder.AddTable(ot.TagOS2, data)
 		}
 	}
+
+	// Variation tables - drop when instanced (axes pinned), otherwise pass through
+	variationTables := []ot.Tag{
+		ot.TagFvar,
+		ot.TagAvar,
+		ot.TagHvar,
+		ot.TagVvar,
+		ot.TagGvar,
+		ot.TagSTAT,
+		ot.TagMvar,
+		ot.TagCvar,
+	}
+	if !p.IsInstanced() {
+		// Keep variation tables if not instancing
+		for _, tag := range variationTables {
+			if p.input.ShouldDropTable(tag) {
+				continue
+			}
+			if p.input.ShouldPassThrough(tag) || p.input.Flags&FlagPassUnrecognized != 0 {
+				if p.source.HasTable(tag) {
+					if data, err := p.source.TableData(tag); err == nil {
+						builder.AddTable(tag, data)
+					}
+				}
+			}
+		}
+	}
+	// When instanced, variation tables are dropped (not copied)
 
 	// Optional tables - only copy if explicitly requested or FlagPassUnrecognized is set
 	optionalTables := []ot.Tag{
